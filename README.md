@@ -1,5 +1,14 @@
 # ICA Lens
 
+> **PatientWords fork of `liusida/ica-lens-paper`.** PatientWords uses this repository as the source for the
+> ActivationDataset format and the scoring equations an ICA adapter must match. On 2026-11-10 no PatientWords
+> lane ran `icalens`. Its role is recorded in the PatientWords engine's
+> [ecosystem map](https://github.com/michaeldgreenphd/patientwords-engine/blob/main/docs/ecosystem.md#patientwords-ica-lens-paper)
+> and [repository registry](https://github.com/michaeldgreenphd/patientwords-engine/blob/main/data/ecosystem/repositories.v1.json).
+> To start offline, follow the engine's
+> [offline quickstart](https://github.com/michaeldgreenphd/patientwords-engine/blob/main/docs/start_here.md#procedure-a-offline-quickstart),
+> which needs no method fork. The rest of this README is the upstream project's.
+
 ICA Lens interprets language-model activations with Independent Component
 Analysis. It is substantially more compute-efficient to fit than an SAE
 dictionary and supports base and instruction-tuned language models.
