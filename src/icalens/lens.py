@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import tempfile
+from collections.abc import Iterable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -31,6 +32,7 @@ from ._artifact import (
 )
 from ._fastica import OBJECTIVE_PERCENTILES, fit_fastica, geometric_median
 from .exceptions import ArtifactError, NotFittedError
+from .kurtosis import STATISTIC as KURTOSIS_STATISTIC
 
 if TYPE_CHECKING:
     from .analysis import ComponentProfile
@@ -185,8 +187,17 @@ class ICALens:
         batch_size: int = 8192,
         objective_every: int = 1,
         provenance: dict[str, Any] | None = None,
+        heldout: Any | None = None,
+        heldout_every: int = 10,
+        heldout_provenance: dict[str, Any] | None = None,
     ) -> ICALens:
-        """Fit or replace the ICA transformation for one layer."""
+        """Fit or replace the ICA transformation for one layer.
+
+        Training (fitting) excess kurtosis is recorded every ``objective_every``
+        iterations. When ``heldout`` activations are given, held-out excess kurtosis
+        is recorded every ``heldout_every`` iterations using the training center and
+        whitening, analogous to a test loss.
+        """
         layer = _validate_layer(layer)
         values = _as_fit_tensor(activations)
         hidden_size = int(values.shape[1])
@@ -211,6 +222,14 @@ class ICALens:
         if objective_every <= 0:
             raise ValueError("objective_every must be positive")
         provenance = _validate_provenance(provenance)
+        heldout_values = None if heldout is None else _as_fit_tensor(heldout)
+        if heldout_values is not None and int(heldout_values.shape[1]) != hidden_size:
+            raise ValueError("held-out activations must have the same hidden size")
+        if heldout_every <= 0:
+            raise ValueError("heldout_every must be positive")
+        heldout_provenance = (
+            None if heldout_provenance is None else _validate_provenance(heldout_provenance)
+        )
 
         preprocessing_center = None
         if self.icalens_preprocessing == "geometric-median-l2":
@@ -237,7 +256,14 @@ class ICALens:
             preprocessing_center=preprocessing_center,
             norm_eps=self.norm_eps,
             objective_every=objective_every,
+            heldout=heldout_values,
+            heldout_every=heldout_every,
         )
+        kurtosis_history = result.kurtosis_history
+        if kurtosis_history is not None:
+            kurtosis_history = {"statistic": KURTOSIS_STATISTIC, **kurtosis_history}
+            if "heldout" in kurtosis_history:
+                kurtosis_history["heldout"]["provenance"] = heldout_provenance
 
         center = _to_numpy(result.center)
         reading = _to_numpy(result.components)
@@ -276,6 +302,8 @@ class ICALens:
                 "gaussian_objective": result.gaussian_objective,
                 "component_objectives": result.component_objectives,
                 "component_strengths": result.component_strengths,
+                "kurtosis_history": kurtosis_history,
+                "component_excess_kurtosis": result.component_excess_kurtosis,
                 "n_samples": int(values.shape[0]),
                 "input_dtype": str(values.dtype).removeprefix("torch."),
                 "fit_device": str(result.center.device),
@@ -319,20 +347,42 @@ class ICALens:
         if isinstance(scores, torch.Tensor):
             if scores.ndim < 1 or not scores.is_floating_point():
                 raise TypeError("scores must be a floating-point array")
-            squared = scores.square()
+            if scores.shape[-1] == 0:
+                return scores.clone()
+            values = scores.float() if scores.dtype in (torch.float16, torch.bfloat16) else scores
+            # The scale cancels in the ratio; it needs no gradient path of its own.
+            scale = values.detach().abs().amax(dim=-1, keepdim=True)
+            safe_scale = torch.where(
+                torch.isfinite(scale) & (scale > 0), scale, torch.ones_like(scale)
+            )
+            scaled = values / safe_scale
+            squared = scaled.square()
             denominator = squared.sum(dim=-1, keepdim=True)
-            return torch.where(denominator > 0, squared / denominator, torch.zeros_like(squared))
+            safe_denominator = torch.where(
+                denominator > 0, denominator, torch.ones_like(denominator)
+            )
+            energy = torch.where(
+                denominator > 0, squared / safe_denominator, torch.zeros_like(squared)
+            )
+            return energy.to(dtype=scores.dtype)
         array = np.asarray(scores)
         if array.ndim < 1 or not np.issubdtype(array.dtype, np.floating):
             raise TypeError("scores must be a floating-point array")
-        squared_array = np.square(array)
+        if array.shape[-1] == 0:
+            return array.copy()
+        values_array = array.astype(np.float32) if array.dtype.itemsize < 4 else array
+        scale_array = np.max(np.abs(values_array), axis=-1, keepdims=True)
+        safe_scale_array = np.where(np.isfinite(scale_array) & (scale_array > 0), scale_array, 1)
+        scaled_array = values_array / safe_scale_array
+        squared_array = np.square(scaled_array)
         denominator_array = squared_array.sum(axis=-1, keepdims=True)
-        return np.divide(
+        energy_array = np.divide(
             squared_array,
             denominator_array,
             out=np.zeros_like(squared_array),
             where=denominator_array > 0,
         )
+        return energy_array.astype(array.dtype, copy=False)
 
     @staticmethod
     def keep_topk(scores: Any, k: int) -> Any:
@@ -382,11 +432,37 @@ class ICALens:
 
         return add_logit_effects(self, result, **kwargs)
 
-    def profile_components(self, inputs: Any, *, layer: int, **kwargs: Any) -> dict[str, Any]:
-        """Build sign, example-token, and logit-lens profiles without refitting."""
-        from .profiling import profile_components
+    def profile_components(
+        self,
+        inputs: Any = None,
+        *,
+        activations: torch.Tensor | None = None,
+        records: list[dict[str, Any]] | None = None,
+        layer: int,
+        additional_readouts: Iterable[dict[str, Any]] = (),
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Profile text or saved activations with one token record per row."""
+        if inputs is not None and activations is not None:
+            raise ValueError("pass only one of inputs or activations")
+        if activations is not None:
+            if records is None:
+                raise ValueError("records are required when profiling saved activations")
+            return self.profile_components_from_activations(
+                activations, records, layer=layer, additional_readouts=additional_readouts, **kwargs
+            )
+        if records is not None:
+            raise ValueError("records can only be supplied with activations")
 
-        return profile_components(self, inputs, layer=layer, **kwargs)
+        from .profiling import profile_components, profile_readouts
+
+        if inputs is None:
+            return profile_readouts(
+                self, layer=layer, additional_readouts=additional_readouts, **kwargs
+            )
+        return profile_components(
+            self, inputs, layer=layer, additional_readouts=additional_readouts, **kwargs
+        )
 
     def profile_components_from_activations(
         self,
@@ -656,9 +732,10 @@ class ICALens:
         if preprocessing_mode not in {"none", "l2", "geometric-median-l2"}:
             raise ArtifactError(f"unsupported icalens_preprocessing: {preprocessing_mode!r}")
         preprocessing_mode = cast(Literal["none", "l2", "geometric-median-l2"], preprocessing_mode)
+        model_revision = model.get("revision")
         lens = cls(
             model_id=str(model["repo_id"]),
-            model_revision=str(model.get("revision") or "unknown"),
+            model_revision=None if model_revision in (None, "", "unknown") else str(model_revision),
             model_type=_validate_model_type(str(model.get("type", "base"))),
             activation_site=str(manifest["activation_site"]),
             layer_indexing=str(manifest.get("layer_indexing", "hidden_states")),
@@ -758,7 +835,20 @@ class ICALens:
         summaries: dict[int, dict[str, Any]] = {}
         for component in profile["components"]:
             component_index = int(component["component"])
-            sign = str(component["dominant_sign"])
+            sign = component.get("dominant_sign")
+            if sign is None:
+                readouts = {"Logit Lens": component["logit_lens"]}
+                readouts.update(component.get("additional_readouts", {}))
+                summaries[component_index] = {
+                    "output_readouts": {
+                        name: {
+                            side: ranking[side]["top_tokens"][:10]
+                            for side in ("positive", "negative")
+                        }
+                        for name, ranking in readouts.items()
+                    },
+                }
+                continue
             summaries[component_index] = {
                 "dominant_sign": sign,
                 "tail_direction": component.get("tail_direction"),
@@ -791,6 +881,10 @@ class ICALens:
                     }
                     for token in component["logit_lens"]["dominant"]["top_tokens"][:10]
                 ],
+                "additional_readouts": {
+                    name: readout["dominant"]["top_tokens"][:10]
+                    for name, readout in component.get("additional_readouts", {}).items()
+                },
                 "r_lens_tokens": [
                     {
                         key: token[key]

@@ -167,12 +167,17 @@ def test_profiles_and_round_trips_component_metadata(tmp_path, monkeypatch) -> N
     assert profile["format_version"] == 1
 
 
-def test_profiles_from_cached_activations_without_analyze(monkeypatch) -> None:
+def test_profiles_from_cached_activations_without_analyze(monkeypatch, tmp_path) -> None:
     signals = np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.2], [0.1, -1.0]], dtype=np.float32)
-    lens = ICALens(model_id="example/model", model_revision="revision").fit(
-        signals, layer=1, n_components=2, max_iter=2
-    )
+    lens = ICALens(
+        model_id="example/model",
+        model_revision="revision",
+        layer_indexing="block_output_zero_based",
+    ).fit(signals, layer=1, n_components=2, max_iter=2)
     lens._analysis_model = TinyModel()
+    lens._analysis_model.model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(3)])
+    checkpoint = tmp_path / "j-lens.pt"
+    torch.save({"J": {1: torch.eye(2)}, "d_model": 2, "n_prompts": 1}, checkpoint)
     lens._analysis_tokenizer = TinyTokenizer()
     lens._analysis_device = "cpu"
     monkeypatch.setattr(
@@ -192,9 +197,18 @@ def test_profiles_from_cached_activations_without_analyze(monkeypatch) -> None:
         for index in range(4)
     ]
 
-    profile = lens.profile_components_from_activations(
-        torch.from_numpy(signals),
-        records,
+    readouts = [{"name": "J Lens", "format": "jacobian", "path": checkpoint}]
+    output_profile = lens.profile_components(layer=1, additional_readouts=readouts, device="cpu")
+    assert "examples" not in output_profile["components"][0]
+    restored = ICALens.from_pretrained(lens.save(tmp_path / "readout-only"))
+    summary = restored._component_profile_summaries(1)[0]["output_readouts"]
+    assert summary["J Lens"]["positive"] and summary["J Lens"]["negative"]
+    report = restored.component_profile(layer=1, component=0).to_html(tmp_path / "readout.html")
+    assert "J Lens tokens · negative" in report.read_text()
+
+    profile = lens.profile_components(
+        activations=torch.from_numpy(signals),
+        records=records,
         layer=1,
         batch_size=2,
         device="cpu",
@@ -204,6 +218,17 @@ def test_profiles_from_cached_activations_without_analyze(monkeypatch) -> None:
     assert profile["n_inputs"] == 2
     assert "excess_kurtosis" in profile["components"][0]["score_statistics"]
     assert profile["components"][0]["examples"]["positive"]["occurrences"]
+
+    component = profile["components"][0]
+    assert (
+        component["additional_readouts"]["J Lens"]["dominant"]
+        == (component["logit_lens"]["dominant"])
+    )
+    assert lens._component_profile_summaries(1)[0]["additional_readouts"]["J Lens"]
+
+    updated = lens.profile_components(layer=1, additional_readouts=readouts, device="cpu")
+    assert updated["components"][0]["examples"] == component["examples"]
+    assert updated["components"][0]["score_statistics"] == component["score_statistics"]
 
 
 def test_refresh_profile_statistics_uses_skewness_for_tail_direction(monkeypatch) -> None:
@@ -427,3 +452,44 @@ def test_add_r_lens_profile_records_explicit_base_to_instruct_transfer(
     assert provenance["model_id"] == "example/model-base"
     assert provenance["transfer"]["kind"] == "base_to_instruct"
     assert provenance["transfer"]["target_model_id"] == "example/model-instruct"
+
+
+@pytest.mark.parametrize(("site", "allowed"), [("mlp_out", True), ("attn_out", False)])
+def test_r_lens_reuses_resid_post_maps_only_for_additive_sites(
+    monkeypatch, site: str, allowed: bool
+) -> None:
+    signals = np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.2], [0.1, -1.0]], dtype=np.float32)
+    lens = ICALens(
+        model_id="example/model",
+        model_revision="revision",
+        activation_site=site,
+        layer_indexing="transformer_blocks_zero_based",
+    ).fit(signals, layer=1, n_components=2, max_iter=2)
+    lens._analysis_model = TinyModel()
+    lens._analysis_tokenizer = TinyTokenizer()
+    lens._analysis_device = "cpu"
+    result = SimpleNamespace(
+        scores=torch.tensor([[2.0, -1.0], [-3.0, 0.5]]),
+        energy=torch.tensor([[0.8, 0.2], [0.97, 0.03]]),
+        tokens=("A", "B"),
+        token_texts=(" alpha", " beta"),
+        token_ids=torch.tensor([10, 11]),
+        positions=torch.tensor([4, 5]),
+    )
+    monkeypatch.setattr(lens, "analyze", lambda *args, **kwargs: result)
+    lens.profile_components(["example"], layer=1, top_k_examples=2)
+    r_lens = {
+        "J": {1: torch.eye(2)},
+        "d_model": 2,
+        "provenance": {"model_id": "example/model", "model_revision": "revision"},
+    }
+
+    if not allowed:
+        with pytest.raises(ValueError, match="R-lens profiling supports activation sites"):
+            lens.add_r_lens_profile(layer=1, r_lens=r_lens, top_k=2, device="cpu")
+        return
+    enriched = lens.add_r_lens_profile(layer=1, r_lens=r_lens, top_k=2, device="cpu")
+    assert "r_lens" in enriched["components"][0]
+    reuse = enriched["r_lens_provenance"]["site_reuse"]
+    assert reuse["source_site"] == "resid_post"
+    assert reuse["target_site"] == "mlp_out"
